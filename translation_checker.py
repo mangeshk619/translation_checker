@@ -21,40 +21,71 @@ class QAIssue:
         }
 
 
-def load_pairs(file_path: str) -> List[Dict[str, str]]:
-    """
-    Load bilingual text pairs from CSV/TSV/TXT/XLIFF/XLSX.
-    For now: support CSV/TSV/TXT/XLSX (simple format).
-    """
-    pairs = []
+def extract_segments(file_path: str, is_source: bool = True) -> List[str]:
+    """Extract ordered segments from Word, Excel, PowerPoint, PDF (source only)."""
+    segments = []
 
-    if file_path.endswith(".csv") or file_path.endswith(".tsv") or file_path.endswith(".txt"):
-        sep = "\t" if file_path.endswith(".tsv") else ","
-        with open(file_path, encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f, delimiter=sep)
-            for row in reader:
-                pairs.append({"id": row.get("id") or row.get("ID") or str(len(pairs) + 1),
-                              "source": row.get("source") or row.get("Source") or "",
-                              "target": row.get("target") or row.get("Target") or ""})
-
-    elif file_path.endswith(".xlsx"):
+    if file_path.endswith(".xlsx"):
         import pandas as pd
         df = pd.read_excel(file_path)
-        for i, row in df.iterrows():
-            pairs.append({"id": str(row.get("id", i+1)),
-                          "source": str(row.get("source", "")),
-                          "target": str(row.get("target", ""))})
+        col = "source" if is_source else "target"
+        if col in df.columns:
+            segments = df[col].astype(str).fillna("").tolist()
+        else:
+            # fallback: take first column
+            segments = df.iloc[:, 0].astype(str).fillna("").tolist()
+
+    elif file_path.endswith(".docx"):
+        from docx import Document
+        doc = Document(file_path)
+        segments = [para.text for para in doc.paragraphs if para.text.strip()]
+
+    elif file_path.endswith(".pptx"):
+        from pptx import Presentation
+        prs = Presentation(file_path)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    segments.append(shape.text)
+
+    elif file_path.endswith(".pdf"):
+        if not is_source:
+            raise ValueError("PDF allowed only for source, not for target.")
+        from PyPDF2 import PdfReader
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                segments.append(text)
 
     else:
-        raise ValueError("Unsupported file format for now.")
+        raise ValueError("Unsupported file format. Allowed: docx, xlsx, pptx, pdf (source only).")
+
+    return segments
+
+
+def load_pairs(src_file: str, tgt_file: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Align segments from source and target files.
+    Returns list of dicts {id, source, target}.
+    """
+    src_segments = extract_segments(src_file, is_source=True)
+    tgt_segments = extract_segments(tgt_file, is_source=False) if tgt_file else []
+
+    pairs = []
+    max_len = max(len(src_segments), len(tgt_segments))
+
+    for i in range(max_len):
+        pairs.append({
+            "id": str(i + 1),
+            "source": src_segments[i] if i < len(src_segments) else "",
+            "target": tgt_segments[i] if i < len(tgt_segments) else "",
+        })
 
     return pairs
 
 
 def load_glossary(file_path: str) -> Dict[str, str]:
-    """
-    Load glossary as dict {source_term: target_term}
-    """
     glossary = {}
     with open(file_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -66,6 +97,7 @@ def load_glossary(file_path: str) -> Dict[str, str]:
     return glossary
 
 
+# --- QA Checks (same as before) ---
 def check_placeholders(uid: str, src: str, tgt: str) -> Optional[QAIssue]:
     pattern = r"%\w+|\{[^}]+\}|\$\w+"
     src_tokens = re.findall(pattern, src)
@@ -116,16 +148,13 @@ def run_checks(pairs: List[Dict[str, str]],
                glossary: Optional[Dict[str, str]] = None,
                config: Optional[Dict] = None,
                length_ratio_limits: Tuple[float, float] = (0.5, 3.0)) -> Tuple[List[QAIssue], Dict]:
-    """
-    Run all QA checks on bilingual pairs
-    """
     issues: List[QAIssue] = []
     stats = {"total": len(pairs), "issues": 0}
 
     for p in pairs:
         uid, src, tgt = p.get("id"), p.get("source", ""), p.get("target", "")
 
-        # Length ratio
+        # Length ratio check
         if src and tgt:
             ratio = len(tgt) / max(1, len(src))
             if not (length_ratio_limits[0] <= ratio <= length_ratio_limits[1]):
